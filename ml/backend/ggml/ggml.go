@@ -15,8 +15,8 @@ import (
 	"log/slog"
 	"maps"
 	"os"
-	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -27,7 +27,6 @@ import (
 	fs "github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/ml"
 	ggml "github.com/ollama/ollama/ml/backend/ggml/ggml/src"
-	"golang.org/x/sync/errgroup"
 )
 
 func devices() []*C.struct_ggml_backend_device {
@@ -235,7 +234,11 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 		return false
 	}
 
-	for _, t := range meta.Tensors().Items() {
+	items := meta.Tensors().Items()
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Offset < items[j].Offset
+	})
+	for _, t := range items {
 		switch {
 		case contains(t.Name, "position_embd", "token_embd", "token_norm_embd", "token_types"):
 			createTensor(tensor{source: t}, input.bts)
@@ -298,62 +301,43 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 
 	var doneBytes atomic.Uint64
 	totalBytes := uint64(n) - meta.Tensors().Offset
-
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(runtime.GOMAXPROCS(0))
-	for _, t := range meta.Tensors().Items() {
-		g.Go(func() error {
-			tts := make([]*C.struct_ggml_tensor, max(1, len(targets[t.Name])))
-			for i := range tts {
-				target := targets[t.Name][i]
-				if target == "" {
-					target = t.Name
-				}
-
-				tt, ok := tensors[target]
-				if !ok {
-					return fmt.Errorf("unassigned tensor: %s", t.Name)
-				}
-
-				tts[i] = tt
+	for _, t := range items {
+		tts := make([]*C.struct_ggml_tensor, max(1, len(targets[t.Name])))
+		for i := range tts {
+			target := targets[t.Name][i]
+			if target == "" {
+				target = t.Name
 			}
 
-			sr := io.NewSectionReader(r, int64(meta.Tensors().Offset+t.Offset), int64(t.Size()))
-			bts := make([]byte, 128*format.KibiByte)
-
-			var s uint64
-			for s < t.Size() {
-				n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
-				if err != nil {
-					return err
-				}
-
-				for _, tt := range tts {
-					C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
-				}
-
-				s += uint64(n)
-
-				if params.Progress != nil {
-					done := doneBytes.Add(uint64(n))
-					params.Progress(float32(done) / float32(totalBytes))
-				}
+			tt, ok := tensors[target]
+			if !ok {
+				return nil, fmt.Errorf("unassigned tensor: %s", t.Name)
 			}
 
-			return nil
-		})
-	}
+			tts[i] = tt
+		}
 
-	// start a goroutine to cancel the errgroup if the parent context is done
-	go func() {
-		<-ctx.Done()
-		g.Go(func() error {
-			return ctx.Err()
-		})
-	}()
+		sr := io.NewSectionReader(r, int64(meta.Tensors().Offset+t.Offset), int64(t.Size()))
+		bts := make([]byte, 128*format.KibiByte)
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+		var s uint64
+		for s < t.Size() {
+			n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
+			if err != nil {
+				return nil, err
+			}
+
+			for _, tt := range tts {
+				C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
+			}
+
+			s += uint64(n)
+
+			if params.Progress != nil {
+				done := doneBytes.Add(uint64(n))
+				params.Progress(float32(done) / float32(totalBytes))
+			}
+		}
 	}
 
 	// map devices to backend buffer types so new tensors can be assigned to the correct device
