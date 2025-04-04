@@ -300,46 +300,58 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 	totalBytes := uint64(n) - meta.Tensors().Offset
 
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(runtime.GOMAXPROCS(0))
-	for _, t := range meta.Tensors().Items() {
+	numBatches := runtime.GOMAXPROCS(0)
+	items := meta.Tensors().Items()
+	totalItems := len(items)
+	batchSize := totalItems / numBatches
+	rem := totalItems % numBatches
+	for i := range numBatches {
+		start := i*batchSize + min(i, rem)
+		end := (i+1)*batchSize + min(i+1, rem)
 		g.Go(func() error {
-			tts := make([]*C.struct_ggml_tensor, max(1, len(targets[t.Name])))
-			for i := range tts {
-				target := targets[t.Name][i]
-				if target == "" {
-					target = t.Name
+			for j := start; j < end; j++ {
+				t := items[j]
+				tts := make([]*C.struct_ggml_tensor, max(1, len(targets[t.Name])))
+				for i := range tts {
+					target := targets[t.Name][i]
+					if target == "" {
+						target = t.Name
+					}
+
+					tt, ok := tensors[target]
+					if !ok {
+						return fmt.Errorf("unassigned tensor: %s", t.Name)
+					}
+
+					tts[i] = tt
 				}
-
-				tt, ok := tensors[target]
-				if !ok {
-					return fmt.Errorf("unassigned tensor: %s", t.Name)
-				}
-
-				tts[i] = tt
-			}
-
-			sr := io.NewSectionReader(r, int64(meta.Tensors().Offset+t.Offset), int64(t.Size()))
-			bts := make([]byte, 128*format.KibiByte)
-
-			var s uint64
-			for s < t.Size() {
-				n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
+				newFile, err := os.Open(r.Name())
 				if err != nil {
 					return err
 				}
+				defer newFile.Close()
+				sr := io.NewSectionReader(newFile, int64(meta.Tensors().Offset+t.Offset), int64(t.Size()))
+				bts := make([]byte, 128*format.KibiByte)
 
-				for _, tt := range tts {
-					C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
-				}
+				var s uint64
+				for s < t.Size() {
+					n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
+					if err != nil {
+						return err
+					}
 
-				s += uint64(n)
+					for _, tt := range tts {
+						C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
+					}
 
-				if params.Progress != nil {
-					done := doneBytes.Add(uint64(n))
-					params.Progress(float32(done) / float32(totalBytes))
+					s += uint64(n)
+
+					if params.Progress != nil {
+						done := doneBytes.Add(uint64(n))
+						params.Progress(float32(done) / float32(totalBytes))
+					}
 				}
 			}
-
 			return nil
 		})
 	}
